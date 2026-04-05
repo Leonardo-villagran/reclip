@@ -43,7 +43,7 @@
     }
 
     .page {
-      max-width: 620px;
+      max-width: 1380px;
       margin: 0 auto;
       padding: 60px 24px 80px;
     }
@@ -160,9 +160,9 @@
     }
 
     .card-thumb {
-      width: 120px;
-      min-width: 120px;
-      height: 80px;
+      width: 150px;
+      min-width: 150px;
+      height: 95px;
       border-radius: 8px;
       overflow: hidden;
       background: var(--card-border);
@@ -236,6 +236,41 @@
       margin-bottom: 8px;
     }
 
+    .source-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      min-width: 0;
+    }
+    .source-link {
+      font-size: 0.66rem;
+      color: var(--muted);
+      text-decoration: none;
+      border-bottom: 1px dashed rgba(58, 58, 56, 0.25);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .source-link:hover {
+      color: var(--fg);
+      border-bottom-color: rgba(58, 58, 56, 0.5);
+    }
+    .copy-btn {
+      padding: 4px 8px;
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font-family: 'DM Mono', monospace;
+      font-size: 0.62rem;
+      cursor: pointer;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+    .copy-btn:hover { color: var(--fg); border-color: var(--muted); }
+
     .card-actions {
       display: flex;
       gap: 6px;
@@ -269,6 +304,61 @@
     .card-status.downloading { color: var(--accent); }
     .card-status.done { color: var(--success); }
     .card-status.error { color: var(--error); }
+
+    .progress-wrap {
+      width: 100%;
+      margin-top: 4px;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: #ece8e1;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.35s ease;
+    }
+    .progress-text {
+      font-size: 0.65rem;
+      color: var(--muted);
+      margin-top: 4px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .media-preview {
+      width: 100%;
+      border-radius: 8px;
+      background: #000;
+    }
+
+    .audio-preview {
+      width: 100%;
+    }
+
+    .preview-panel {
+      width: 300px;
+      min-width: 300px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-left: 1px solid var(--card-border);
+      padding-left: 12px;
+      margin-left: 2px;
+    }
+
+    .preview-panel .media-preview {
+      max-height: 175px;
+      object-fit: contain;
+    }
+
+    .preview-panel .audio-preview {
+      width: 100%;
+    }
 
     .q-chip {
       padding: 4px 10px;
@@ -365,7 +455,7 @@
     }
 
     /* Mobile */
-    @media (max-width: 500px) {
+    @media (max-width: 860px) {
       .brand h1 { font-size: 3rem; }
       .page { padding: 40px 16px 60px; }
       .card { flex-direction: column; gap: 10px; }
@@ -377,6 +467,15 @@
       .card-title { white-space: normal; }
       .controls { flex-wrap: wrap; }
       .fetch-btn { width: 100%; }
+      .preview-panel {
+        width: 100%;
+        min-width: unset;
+        border-left: none;
+        border-top: 1px solid var(--card-border);
+        padding-left: 0;
+        padding-top: 10px;
+        margin-left: 0;
+      }
     }
   </style>
 </head>
@@ -387,7 +486,7 @@
       <p>Free media downloader</p>
     </div>
 
-    <textarea id="urls" placeholder="Paste one or more URLs..." rows="2"></textarea>
+    <textarea id="urls" placeholder="Paste video URLs, magnet links, or .torrent URLs..." rows="2"></textarea>
     <p class="hint">Multiple links? Separate with spaces, commas, or newlines.</p>
 
     <div class="controls">
@@ -418,7 +517,11 @@
     }
 
     function parseUrls(text) {
-      return [...new Set(text.split(/[\s,]+/).map(u => u.trim()).filter(u => u.startsWith('http')))];
+      const matches = text.match(/magnet:[^\s]+|https?:\/\/[^\s]+/gi) || [];
+      const clean = matches
+        .map(u => u.trim().replace(/[),.;]+$/, ''))
+        .filter(Boolean);
+      return [...new Set(clean)];
     }
 
     function fmtDur(s) {
@@ -434,7 +537,37 @@
       return d.innerHTML;
     }
 
+    function shortUrl(u) {
+      if (!u) return '';
+      return u.length > 72 ? u.slice(0, 72) + '...' : u;
+    }
+
+    function isVideoFile(name) {
+      return /\.(mp4|webm|mov|m4v|mkv)$/i.test(name || '');
+    }
+
+    function isAudioFile(name) {
+      return /\.(mp3|m4a|aac|ogg|wav|flac|opus)$/i.test(name || '');
+    }
+
+    async function copyUrl(idx) {
+      const url = cardData[idx]?.url || '';
+      if (!url) return;
+      try {
+        await navigator.clipboard.writeText(url);
+      } catch {
+        const ta = document.createElement('textarea');
+        ta.value = url;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      }
+    }
+
     function friendlyError(err) {
+      if (err.includes('aria2c')) return 'Torrent support needs aria2c installed on server';
+      if (err.includes('Torrent')) return err;
       if (err.includes('Unsupported URL')) return 'This URL is not supported';
       if (err.includes('Video unavailable')) return 'Video is unavailable or private';
       if (err.includes('Private video')) return 'This video is private';
@@ -453,21 +586,50 @@
 
     async function go() {
       const urls = parseUrls(document.getElementById('urls').value);
-      if (!urls.length) return;
+      if (!urls.length) {
+        const container = document.getElementById('cards');
+        container.innerHTML = `
+          <div class="card card-error">
+            <div class="card-thumb">
+              <div class="card-error-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="card-title" style="color:var(--error)">No valid links found</div>
+              <div class="card-error-msg">Paste http(s) URLs, magnet links, or .torrent URLs.</div>
+            </div>
+          </div>
+        `;
+        return;
+      }
 
       const btn = document.getElementById('goBtn');
       const container = document.getElementById('cards');
       btn.disabled = true;
-      btn.textContent = 'Loading...';
-      container.innerHTML = '';
-      cardData = [];
+      btn.textContent = 'Fetching...';
+      document.getElementById('urls').value = '';
+      const inProgress = new Set(['loading', 'ready', 'downloading']);
+      const pending = [];
 
-      for (let i = 0; i < urls.length; i++) {
-        const url = urls[i];
+      for (const url of urls) {
+        const existingIdx = cardData.findIndex(c => c.url === url && inProgress.has(c.status));
+        if (existingIdx !== -1) {
+          continue;
+        }
         const idx = cardData.length;
         cardData.push({ url, status: 'loading' });
         renderCard(idx);
+        pending.push({ url, idx });
+      }
 
+      if (!pending.length) {
+        btn.disabled = false;
+        btn.textContent = 'Fetch';
+        return;
+      }
+
+      const tasks = pending.map(async ({ url, idx }) => {
         try {
           const res = await fetch('/api/info', {
             method: 'POST',
@@ -477,27 +639,30 @@
           const data = await res.json();
           if (data.error) {
             cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error };
-          } else {
-            cardData[idx] = {
-              ...cardData[idx],
-              status: 'ready',
-              title: data.title || '',
-              thumbnail: data.thumbnail || '',
-              duration: data.duration,
-              uploader: data.uploader || '',
-              formats: data.formats || [],
-              selectedFormatId: data.formats?.[0]?.id || null,
-            };
+            renderCard(idx);
+            return;
           }
+
+          cardData[idx] = {
+            ...cardData[idx],
+            status: 'ready',
+            title: data.title || '',
+            thumbnail: data.thumbnail || '',
+            duration: data.duration,
+            uploader: data.uploader || '',
+            is_torrent: !!data.is_torrent,
+            formats: data.formats || [],
+            selectedFormatId: data.formats?.[0]?.id || null,
+          };
+          renderCard(idx);
+          await dlCard(idx);
         } catch (err) {
           cardData[idx] = { ...cardData[idx], status: 'info-error', error: err.message };
+          renderCard(idx);
         }
-        renderCard(idx);
-      }
+      });
 
-      if (cardData.filter(c => c.status === 'ready').length > 1) {
-        renderDownloadAll();
-      }
+      await Promise.allSettled(tasks);
 
       btn.disabled = false;
       btn.textContent = 'Fetch';
@@ -558,32 +723,59 @@
       }
 
       let qualityChips = '';
-      if (!isAudio && c.formats && c.formats.length > 1) {
+      if (!isAudio && !c.is_torrent && c.formats && c.formats.length > 1) {
         qualityChips = c.formats.map(f =>
           `<button class="q-chip${f.id === c.selectedFormatId ? ' active' : ''}" onclick="pickFormat(${idx}, '${f.id}')">${f.label}</button>`
         ).join('');
       }
 
       let actionHtml = '';
+      let mediaHtml = '';
+      const sourceHtml = `
+        <div class="source-row">
+          <a class="source-link" href="${esc(c.url || '')}" target="_blank" rel="noopener noreferrer" title="${esc(c.url || '')}">${esc(shortUrl(c.url || ''))}</a>
+          <button class="copy-btn" onclick="copyUrl(${idx})">Copy</button>
+        </div>
+      `;
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
-        actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+        const p = Number.isFinite(c.progress) ? Math.max(0, Math.min(100, Math.floor(c.progress))) : 0;
+        const parts = [`${p}%`];
+        if (c.speed) parts.push(c.speed);
+        if (c.eta) parts.push(`ETA ${c.eta}`);
+        const transferText = parts.join(' · ');
+        actionHtml = `
+          <span class="card-status downloading"><span class="spin"></span> ${esc(c.message || 'Downloading...')}${c.stalled ? ' (waiting...)' : ''}</span>
+          <div class="progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" style="width:${p}%"></div></div>
+            <div class="progress-text">${esc(transferText)}</div>
+          </div>
+        `;
       } else if (c.status === 'done') {
-        actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
-          <span class="card-status done">${esc(c.filename || '')}</span>`;
+        if (isVideoFile(c.filename) && c.jobId) {
+          mediaHtml = `<video class="media-preview" controls preload="metadata" src="/api/preview/${c.jobId}"></video>`;
+        } else if (isAudioFile(c.filename) && c.jobId) {
+          mediaHtml = `<audio class="audio-preview" controls preload="metadata" src="/api/preview/${c.jobId}"></audio>`;
+        }
+        actionHtml = `<span class="card-status done">Saved: ${esc(c.filename || '')}${c.download_dir ? ' · ' + esc(c.download_dir) : ''}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
       }
 
+      el.className = mediaHtml ? 'card card-with-preview' : 'card';
+      const mediaPanelHtml = mediaHtml ? `<div class="preview-panel">${mediaHtml}</div>` : '';
+
       el.innerHTML = `
         <div class="card-thumb">${thumbHtml}</div>
         <div class="card-body">
           <div class="card-title">${esc(c.title || 'Untitled')}</div>
-          <div class="card-meta">${esc(c.uploader)}${c.duration ? ' · ' + fmtDur(c.duration) : ''}</div>
+          <div class="card-meta">${esc(c.uploader)}${c.duration ? ' · ' + fmtDur(c.duration) : ''}${c.is_torrent ? ' · TORRENT' : ''}</div>
+          ${sourceHtml}
           <div class="card-actions">${actionHtml}</div>
         </div>
+        ${mediaPanelHtml}
       `;
     }
 
@@ -607,6 +799,10 @@
       const c = cardData[idx];
       c.status = 'downloading';
       c.error = null;
+      c.progress = 0;
+      c.speed = '';
+      c.eta = '';
+      c.message = 'Starting...';
       renderCard(idx);
 
       try {
@@ -646,8 +842,18 @@
             clearInterval(iv);
             c.status = 'done';
             c.filename = data.filename;
+            c.progress = data.progress ?? 100;
+            c.message = data.message || 'Completed';
+            c.download_dir = data.download_dir || '';
             renderCard(idx);
-            saveCard(idx);
+          } else if (data.status === 'downloading') {
+            c.status = 'downloading';
+            c.progress = data.progress ?? c.progress ?? 0;
+            c.speed = data.speed || '';
+            c.eta = data.eta || '';
+            c.message = data.message || c.message || 'Downloading...';
+            c.stalled = !!data.stalled;
+            renderCard(idx);
           } else if (data.status === 'error') {
             clearInterval(iv);
             c.status = 'error';

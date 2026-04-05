@@ -41,9 +41,37 @@ else
 fi
 
 PORT="${PORT:-8899}"
+HOST="${HOST:-127.0.0.1}"
 export PORT
+export HOST
+
+OPEN_HOST="$HOST"
+if [ "$OPEN_HOST" = "0.0.0.0" ] || [ "$OPEN_HOST" = "127.0.0.1" ]; then
+    OPEN_HOST="localhost"
+fi
+
+APP_URL="http://$OPEN_HOST:$PORT"
+
+COMET_CMD=""
+if command -v comet >/dev/null 2>&1; then
+    COMET_CMD="comet"
+else
+    maybe_comet="$(compgen -c | grep -E '^comet' | head -n1 || true)"
+    if [ -n "$maybe_comet" ] && command -v "$maybe_comet" >/dev/null 2>&1; then
+        COMET_CMD="$maybe_comet"
+    fi
+fi
 
 echo ""
-echo "  ReClip is running at http://localhost:$PORT"
+echo "  ReClip is running at $APP_URL"
 echo ""
+
+if [ -n "$COMET_CMD" ]; then
+    "$COMET_CMD" "$APP_URL" >/dev/null 2>&1 &
+elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$APP_URL" >/dev/null 2>&1 &
+elif command -v open >/dev/null 2>&1; then
+    open "$APP_URL" >/dev/null 2>&1 &
+fi
+
 python3 app.py

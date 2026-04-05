@@ -1,0 +1,19 @@
+services:
+  reclip:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reclip
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8899}:${PORT:-8899}"
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${PORT:-8899}
+      DOWNLOAD_DIR: /app/downloads
+    volumes:
+      - type: bind
+        source: ${DOWNLOAD_DIR:-./downloads}
+        target: /app/downloads
+    restart: unless-stopped
