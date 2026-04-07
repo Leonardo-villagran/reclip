@@ -270,6 +270,10 @@
       flex-shrink: 0;
     }
     .copy-btn:hover { color: var(--fg); border-color: var(--muted); }
+    .copy-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
 
     .card-actions {
       display: flex;
@@ -304,6 +308,51 @@
     .card-status.downloading { color: var(--accent); }
     .card-status.done { color: var(--success); }
     .card-status.error { color: var(--error); }
+    .toast-stack {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 50;
+      pointer-events: none;
+    }
+    .toast {
+      min-width: 280px;
+      max-width: 420px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(45, 138, 78, 0.22);
+      background: rgba(255, 252, 247, 0.96);
+      box-shadow: 0 14px 34px rgba(58, 58, 56, 0.12);
+      color: var(--fg);
+      transform: translateY(14px);
+      opacity: 0;
+      animation: toastIn 0.25s ease forwards;
+      pointer-events: auto;
+    }
+    .toast.hide {
+      animation: toastOut 0.25s ease forwards;
+    }
+    .toast-title {
+      font-size: 0.7rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--success);
+      margin-bottom: 5px;
+    }
+    .toast-body {
+      font-size: 0.74rem;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    @keyframes toastIn {
+      to { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes toastOut {
+      to { transform: translateY(10px); opacity: 0; }
+    }
 
     .progress-wrap {
       width: 100%;
@@ -505,6 +554,7 @@
       Pinterest &middot; Tumblr &middot; Threads &middot; LinkedIn &middot; 1000+ more
     </div>
   </div>
+  <div id="toastStack" class="toast-stack"></div>
 
   <script>
     let currentFormat = 'video';
@@ -563,6 +613,39 @@
         document.execCommand('copy');
         ta.remove();
       }
+    }
+
+    async function openInExplorer(idx) {
+      const jobId = cardData[idx]?.jobId;
+      if (!jobId) return;
+
+      try {
+        const res = await fetch(`/api/open/${jobId}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          throw new Error(data.error);
+        }
+      } catch (err) {
+        alert(friendlyError(err.message || 'Could not open Windows Explorer'));
+      }
+    }
+
+    function showToast(title, body) {
+      const stack = document.getElementById('toastStack');
+      if (!stack) return;
+
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      toast.innerHTML = `
+        <div class="toast-title">${esc(title)}</div>
+        <div class="toast-body">${esc(body)}</div>
+      `;
+      stack.appendChild(toast);
+
+      setTimeout(() => {
+        toast.classList.add('hide');
+        setTimeout(() => toast.remove(), 260);
+      }, 4200);
     }
 
     function friendlyError(err) {
@@ -758,7 +841,10 @@
         } else if (isAudioFile(c.filename) && c.jobId) {
           mediaHtml = `<audio class="audio-preview" controls preload="metadata" src="/api/preview/${c.jobId}"></audio>`;
         }
-        actionHtml = `<span class="card-status done">Saved: ${esc(c.filename || '')}${c.download_dir ? ' · ' + esc(c.download_dir) : ''}</span>`;
+        actionHtml = `
+          <span class="card-status done">Saved: ${esc(c.filename || '')}${c.download_dir ? ' · ' + esc(c.download_dir) : ''}</span>
+          <button class="copy-btn" onclick="openInExplorer(${idx})">Show In Explorer</button>
+        `;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -840,12 +926,16 @@
           const data = await res.json();
           if (data.status === 'done') {
             clearInterval(iv);
+            const justFinished = c.status !== 'done';
             c.status = 'done';
             c.filename = data.filename;
             c.progress = data.progress ?? 100;
             c.message = data.message || 'Completed';
             c.download_dir = data.download_dir || '';
             renderCard(idx);
+            if (justFinished) {
+              showToast('Archivo listo', c.filename || c.title || 'Descarga completada');
+            }
           } else if (data.status === 'downloading') {
             c.status = 'downloading';
             c.progress = data.progress ?? c.progress ?? 0;

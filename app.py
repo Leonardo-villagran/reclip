@@ -9,6 +9,8 @@ import re
 import time
 import atexit
 import mimetypes
+import hashlib
+import logging
 from urllib.parse import urlparse, parse_qs, unquote
 from flask import Flask, request, jsonify, send_file, render_template
 from dotenv import load_dotenv
@@ -28,8 +30,18 @@ PREVIEW_DIR = os.path.join(DOWNLOAD_DIR, ".preview")
 os.makedirs(PREVIEW_DIR, exist_ok=True)
 PREVIEW_TTL_HOURS = float(os.environ.get("PREVIEW_TTL_HOURS", "24"))
 PREVIEW_VERSION = "v2"
+AUTO_RESUME_RETRIES = max(0, int(os.environ.get("AUTO_RESUME_RETRIES", "3")))
+AUTO_RESUME_DELAY_SECONDS = max(1, int(os.environ.get("AUTO_RESUME_DELAY_SECONDS", "5")))
+VIDEO_ENCODER = (os.environ.get("VIDEO_ENCODER", "auto") or "auto").strip().lower()
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("reclip")
 
 jobs = {}
+AVAILABLE_FFMPEG_ENCODERS = None
 
 
 def is_magnet_url(url):
@@ -141,6 +153,98 @@ def update_job(job, *, status=None, progress=None, message=None, error=None, fil
     job["updated_at"] = time.time()
 
 
+def log_job(job_id, event, **fields):
+    payload = " ".join(f"{key}={json.dumps(value, ensure_ascii=True)}" for key, value in fields.items())
+    logger.info("job=%s event=%s %s", job_id, event, payload)
+
+
+def get_available_ffmpeg_encoders():
+    global AVAILABLE_FFMPEG_ENCODERS
+    if AVAILABLE_FFMPEG_ENCODERS is not None:
+        return AVAILABLE_FFMPEG_ENCODERS
+
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        AVAILABLE_FFMPEG_ENCODERS = set()
+        return AVAILABLE_FFMPEG_ENCODERS
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_cmd, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            AVAILABLE_FFMPEG_ENCODERS = set()
+            return AVAILABLE_FFMPEG_ENCODERS
+        AVAILABLE_FFMPEG_ENCODERS = set(re.findall(r"\b([a-z0-9_]+)\b", result.stdout.lower()))
+    except Exception:
+        AVAILABLE_FFMPEG_ENCODERS = set()
+    return AVAILABLE_FFMPEG_ENCODERS
+
+
+def choose_h264_encoder():
+    available = get_available_ffmpeg_encoders()
+    allowed = {"auto", "h264_nvenc", "h264_amf", "h264_qsv", "libx264"}
+    configured = VIDEO_ENCODER if VIDEO_ENCODER in allowed else "auto"
+    if configured != "auto":
+        return configured if configured in available else "libx264"
+    for encoder in ("h264_nvenc", "h264_amf", "h264_qsv", "libx264"):
+        if encoder in available:
+            return encoder
+    return "libx264"
+
+
+def build_h264_encoding_args(encoder_name):
+    if encoder_name == "h264_nvenc":
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",
+            "-rc:v", "vbr",
+            "-cq:v", "19",
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+        ]
+    if encoder_name == "h264_amf":
+        return [
+            "-c:v", "h264_amf",
+            "-quality", "quality",
+            "-rc", "cqp",
+            "-qp_i", "19",
+            "-qp_p", "19",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+        ]
+    if encoder_name == "h264_qsv":
+        return [
+            "-c:v", "h264_qsv",
+            "-global_quality", "19",
+            "-look_ahead", "0",
+            "-pix_fmt", "nv12",
+            "-profile:v", "high",
+        ]
+    return [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+    ]
+
+
+def summarize_ffmpeg_error(stderr_text):
+    lines = [line.strip() for line in (stderr_text or "").splitlines() if line.strip()]
+    if not lines:
+        return "FFmpeg conversion failed"
+    for line in reversed(lines):
+        lower = line.lower()
+        if "error" in lower or "failed" in lower or "cannot" in lower:
+            return line
+    return lines[-1]
+
+
 def set_transfer_stats(job, line):
     speed, eta = parse_transfer_stats(line)
     if speed is not None:
@@ -191,6 +295,26 @@ def parse_transfer_stats(line):
     return speed, eta
 
 
+def build_resume_key(url, format_choice, format_id):
+    # Stable key so retries/restarts can reuse the same .part files.
+    raw = f"{url}|{format_choice}|{format_id or ''}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def is_non_retryable_download_error(output_text):
+    text = (output_text or "").lower()
+    patterns = [
+        "unsupported url",
+        "unsupported site",
+        "video unavailable",
+        "this video is private",
+        "requested format is not available",
+        "sign in to confirm",
+        "login required",
+    ]
+    return any(p in text for p in patterns)
+
+
 def run_with_progress(cmd, on_line, timeout=None):
     process = subprocess.Popen(
         cmd,
@@ -227,6 +351,112 @@ def run_with_progress(cmd, on_line, timeout=None):
     finally:
         if process.stdout:
             process.stdout.close()
+
+
+def transcode_video_for_editing(source_file, job):
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if not ffmpeg_cmd:
+        raise RuntimeError("ffmpeg is required to export Vegas-compatible MP4 files")
+
+    directory = os.path.dirname(source_file)
+    base_name = os.path.splitext(os.path.basename(source_file))[0]
+    target_file = make_unique_path(directory, f"{base_name}.vegas.mp4")
+    job_id = job.get("job_id", "unknown")
+    primary_encoder = choose_h264_encoder()
+    encoders_to_try = [primary_encoder]
+    if primary_encoder != "libx264":
+        encoders_to_try.append("libx264")
+
+    last_error = "FFmpeg conversion failed"
+    for attempt_index, encoder_name in enumerate(encoders_to_try, start=1):
+        cmd = [
+            ffmpeg_cmd,
+            "-y",
+            "-i",
+            source_file,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-fps_mode",
+            "cfr",
+        ] + build_h264_encoding_args(encoder_name) + [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            "-max_muxing_queue_size",
+            "1024",
+            target_file,
+        ]
+
+        transcode_started_at = time.time()
+        log_job(
+            job_id,
+            "transcode_start",
+            source=source_file,
+            target=target_file,
+            encoder=encoder_name,
+            attempt=attempt_index,
+            ffmpeg=ffmpeg_cmd,
+            command=cmd,
+        )
+        update_job(
+            job,
+            status="downloading",
+            progress=96,
+            message=f"Converting to Sony Vegas compatible MP4 ({encoder_name})...",
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        transcode_elapsed = round(time.time() - transcode_started_at, 3)
+        if result.returncode == 0 and os.path.exists(target_file):
+            try:
+                size_bytes = os.path.getsize(target_file)
+            except OSError:
+                size_bytes = None
+            log_job(
+                job_id,
+                "transcode_done",
+                elapsed_seconds=transcode_elapsed,
+                returncode=result.returncode,
+                encoder=encoder_name,
+                output=target_file,
+                size_bytes=size_bytes,
+            )
+            return target_file
+
+        last_error = summarize_ffmpeg_error(result.stderr)
+        stderr_tail = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()][-12:]
+        log_job(
+            job_id,
+            "transcode_error",
+            elapsed_seconds=transcode_elapsed,
+            returncode=result.returncode,
+            encoder=encoder_name,
+            error=last_error,
+            stderr_tail=stderr_tail,
+        )
+        if os.path.exists(target_file):
+            try:
+                os.remove(target_file)
+            except OSError:
+                pass
+
+        if encoder_name != "libx264":
+            update_job(
+                job,
+                status="downloading",
+                progress=96,
+                message=f"{encoder_name} failed, retrying final conversion on CPU...",
+            )
+
+    raise RuntimeError(last_error)
 
 
 def ensure_preview_file(job_id, source_file):
@@ -304,6 +534,9 @@ atexit.register(cleanup_old_previews)
 
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
+    job["job_id"] = job_id
+    job_started_at = time.time()
+    log_job(job_id, "job_start", url=url, format_choice=format_choice, format_id=format_id)
 
     if is_torrent_source(url):
         aria2c_cmd = resolve_aria2c()
@@ -327,6 +560,7 @@ def run_download(job_id, url, format_choice, format_id):
         ]
 
         try:
+            torrent_started_at = time.time()
             def on_torrent_line(line):
                 set_transfer_stats(job, line)
                 percent = parse_percent(line)
@@ -340,6 +574,12 @@ def run_download(job_id, url, format_choice, format_id):
                     update_job(job, message=line.strip())
 
             return_code, output = run_with_progress(cmd, on_torrent_line, timeout=7200)
+            log_job(
+                job_id,
+                "torrent_download_done",
+                elapsed_seconds=round(time.time() - torrent_started_at, 3),
+                returncode=return_code,
+            )
             if return_code != 0:
                 last = [l for l in output.splitlines() if l.strip()]
                 err = last[-1] if last else "Torrent download failed"
@@ -354,7 +594,6 @@ def run_download(job_id, url, format_choice, format_id):
                 update_job(job, status="error", error="Torrent finished but no file was found")
                 return
 
-            job["status"] = "done"
             title = job.get("title", "").strip()
             chosen, final_name = finalize_output_file(chosen, title, os.path.basename(chosen))
             job["file"] = chosen
@@ -362,6 +601,13 @@ def run_download(job_id, url, format_choice, format_id):
             if chosen.lower().endswith(".mkv"):
                 threading.Thread(target=ensure_preview_file, args=(job_id, chosen), daemon=True).start()
             update_job(job, status="done", progress=100, message="Completed", filename=job["filename"])
+            log_job(
+                job_id,
+                "job_done",
+                elapsed_seconds=round(time.time() - job_started_at, 3),
+                output=job["file"],
+                filename=job["filename"],
+            )
             return
         except subprocess.TimeoutExpired:
             update_job(job, status="error", error="Torrent download timed out (2h limit)")
@@ -370,7 +616,9 @@ def run_download(job_id, url, format_choice, format_id):
             update_job(job, status="error", error=str(e))
             return
 
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+    resume_key = job.get("resume_key") or build_resume_key(url, format_choice, format_id)
+    out_template = os.path.join(DOWNLOAD_DIR, f"{resume_key}.%(ext)s")
+    existing_parts = glob.glob(os.path.join(DOWNLOAD_DIR, f"{resume_key}*"))
 
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
 
@@ -384,10 +632,21 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        update_job(job, status="downloading", progress=0, message="Starting download...")
         job["speed"] = ""
         job["eta"] = ""
-        cmd = ["yt-dlp", "--newline", "--no-playlist", "-o", out_template] + cmd[4:]
+        cmd = [
+            "yt-dlp",
+            "--newline",
+            "--no-playlist",
+            "--continue",
+            "--part",
+            "--retries",
+            "20",
+            "--fragment-retries",
+            "20",
+            "-o",
+            out_template,
+        ] + cmd[4:]
 
         def on_ytdlp_line(line):
             line = line.strip()
@@ -404,14 +663,56 @@ def run_download(job_id, url, format_choice, format_id):
             if line.startswith("ERROR"):
                 update_job(job, message=line)
 
-        return_code, output = run_with_progress(cmd, on_ytdlp_line, timeout=300)
-        if return_code != 0:
+        attempts = AUTO_RESUME_RETRIES + 1
+        output = ""
+        download_started_at = time.time()
+        for attempt in range(1, attempts + 1):
+            has_partial = bool(glob.glob(os.path.join(DOWNLOAD_DIR, f"{resume_key}*")))
+            if attempt == 1:
+                start_message = "Resuming download..." if (existing_parts or has_partial) else "Starting download..."
+                update_job(job, status="downloading", progress=0, message=start_message)
+            else:
+                update_job(
+                    job,
+                    status="downloading",
+                    message=f"Connection lost, retrying automatically ({attempt}/{attempts})...",
+                )
+
+            try:
+                return_code, output = run_with_progress(cmd, on_ytdlp_line, timeout=300)
+            except subprocess.TimeoutExpired:
+                return_code = 124
+                output = "Download stalled or connection lost"
+            log_job(
+                job_id,
+                "ytdlp_attempt_done",
+                attempt=attempt,
+                returncode=return_code,
+                elapsed_seconds=round(time.time() - download_started_at, 3),
+            )
+
+            if return_code == 0:
+                break
+
+            should_retry = attempt < attempts and not is_non_retryable_download_error(output)
+            if should_retry:
+                update_job(
+                    job,
+                    status="downloading",
+                    message=(
+                        f"Connection interrupted, auto-resume in {AUTO_RESUME_DELAY_SECONDS}s "
+                        f"({attempt}/{attempts})"
+                    ),
+                )
+                time.sleep(AUTO_RESUME_DELAY_SECONDS)
+                continue
+
             last = [l for l in output.splitlines() if l.strip()]
             err = last[-1] if last else "Download failed"
             update_job(job, status="error", error=err)
             return
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{resume_key}.*"))
         if not files:
             update_job(job, status="error", error="Download completed but no file was found")
             return
@@ -430,18 +731,47 @@ def run_download(job_id, url, format_choice, format_id):
                 except OSError:
                     pass
 
-        job["status"] = "done"
         title = job.get("title", "").strip()
+        log_job(
+            job_id,
+            "download_stage_done",
+            elapsed_seconds=round(time.time() - download_started_at, 3),
+            chosen=chosen,
+            title=title,
+        )
+        if format_choice != "audio":
+            update_job(job, status="downloading", progress=95, message="Download finished, starting final conversion...")
+            chosen = transcode_video_for_editing(chosen, job)
+            log_job(job_id, "transcode_stage_selected", output=chosen)
+
         chosen, final_name = finalize_output_file(chosen, title, os.path.basename(chosen))
         job["file"] = chosen
         job["filename"] = final_name
+        log_job(job_id, "finalize_done", output=chosen, filename=final_name)
+
+        for f in files:
+            if f != chosen:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
         if chosen.lower().endswith(".mkv"):
             threading.Thread(target=ensure_preview_file, args=(job_id, chosen), daemon=True).start()
         update_job(job, status="done", progress=100, message="Completed", filename=job["filename"])
+        log_job(
+            job_id,
+            "job_done",
+            elapsed_seconds=round(time.time() - job_started_at, 3),
+            output=job["file"],
+            filename=job["filename"],
+        )
     except subprocess.TimeoutExpired:
-        update_job(job, status="error", error="Download timed out (5 min limit)")
+        update_job(job, status="error", error="Download timed out after automatic retries")
+        log_job(job_id, "job_error", elapsed_seconds=round(time.time() - job_started_at, 3), error="Download timed out after automatic retries")
     except Exception as e:
         update_job(job, status="error", error=str(e))
+        log_job(job_id, "job_error", elapsed_seconds=round(time.time() - job_started_at, 3), error=str(e))
 
 
 @app.route("/")
@@ -527,6 +857,7 @@ def start_download():
         "status": "downloading",
         "url": url,
         "title": title,
+        "resume_key": build_resume_key(url, format_choice, format_id),
         "progress": 0,
         "speed": "",
         "eta": "",
