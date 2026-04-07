@@ -153,6 +153,12 @@ def update_job(job, *, status=None, progress=None, message=None, error=None, fil
     job["updated_at"] = time.time()
 
 
+def set_job_metric(job, key, value):
+    metrics = job.setdefault("metrics", {})
+    metrics[key] = value
+    job["updated_at"] = time.time()
+
+
 def log_job(job_id, event, **fields):
     payload = " ".join(f"{key}={json.dumps(value, ensure_ascii=True)}" for key, value in fields.items())
     logger.info("job=%s event=%s %s", job_id, event, payload)
@@ -416,6 +422,8 @@ def transcode_video_for_editing(source_file, job):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         transcode_elapsed = round(time.time() - transcode_started_at, 3)
         if result.returncode == 0 and os.path.exists(target_file):
+            set_job_metric(job, "encoder", encoder_name)
+            set_job_metric(job, "convert_seconds", transcode_elapsed)
             try:
                 size_bytes = os.path.getsize(target_file)
             except OSError:
@@ -536,6 +544,7 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     job["job_id"] = job_id
     job_started_at = time.time()
+    set_job_metric(job, "job_started_at", job_started_at)
     log_job(job_id, "job_start", url=url, format_choice=format_choice, format_id=format_id)
 
     if is_torrent_source(url):
@@ -574,6 +583,7 @@ def run_download(job_id, url, format_choice, format_id):
                     update_job(job, message=line.strip())
 
             return_code, output = run_with_progress(cmd, on_torrent_line, timeout=7200)
+            set_job_metric(job, "download_seconds", round(time.time() - torrent_started_at, 3))
             log_job(
                 job_id,
                 "torrent_download_done",
@@ -601,6 +611,7 @@ def run_download(job_id, url, format_choice, format_id):
             if chosen.lower().endswith(".mkv"):
                 threading.Thread(target=ensure_preview_file, args=(job_id, chosen), daemon=True).start()
             update_job(job, status="done", progress=100, message="Completed", filename=job["filename"])
+            set_job_metric(job, "total_seconds", round(time.time() - job_started_at, 3))
             log_job(
                 job_id,
                 "job_done",
@@ -666,6 +677,7 @@ def run_download(job_id, url, format_choice, format_id):
         attempts = AUTO_RESUME_RETRIES + 1
         output = ""
         download_started_at = time.time()
+        set_job_metric(job, "download_started_at", download_started_at)
         for attempt in range(1, attempts + 1):
             has_partial = bool(glob.glob(os.path.join(DOWNLOAD_DIR, f"{resume_key}*")))
             if attempt == 1:
@@ -732,6 +744,7 @@ def run_download(job_id, url, format_choice, format_id):
                     pass
 
         title = job.get("title", "").strip()
+        set_job_metric(job, "download_seconds", round(time.time() - download_started_at, 3))
         log_job(
             job_id,
             "download_stage_done",
@@ -743,6 +756,9 @@ def run_download(job_id, url, format_choice, format_id):
             update_job(job, status="downloading", progress=95, message="Download finished, starting final conversion...")
             chosen = transcode_video_for_editing(chosen, job)
             log_job(job_id, "transcode_stage_selected", output=chosen)
+        else:
+            set_job_metric(job, "encoder", "none")
+            set_job_metric(job, "convert_seconds", 0.0)
 
         chosen, final_name = finalize_output_file(chosen, title, os.path.basename(chosen))
         job["file"] = chosen
@@ -759,6 +775,7 @@ def run_download(job_id, url, format_choice, format_id):
         if chosen.lower().endswith(".mkv"):
             threading.Thread(target=ensure_preview_file, args=(job_id, chosen), daemon=True).start()
         update_job(job, status="done", progress=100, message="Completed", filename=job["filename"])
+        set_job_metric(job, "total_seconds", round(time.time() - job_started_at, 3))
         log_job(
             job_id,
             "job_done",
@@ -891,6 +908,7 @@ def check_status(job_id):
         "eta": job.get("eta", ""),
         "message": job.get("message", ""),
         "download_dir": DOWNLOAD_DIR,
+        "metrics": job.get("metrics", {}),
         "stalled": stalled,
     })
 
